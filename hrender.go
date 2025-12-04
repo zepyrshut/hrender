@@ -24,6 +24,11 @@ type (
 	}
 )
 
+const (
+	ContentType         string = "Content-Type"
+	ContentTextHTMLUTF8 string = "text/html; charset=utf-8"
+)
+
 // NewHTMLRender initializes a new Render instance.
 // fileSystem: The file system containing the templates (usually embed.FS or os.DirFS).
 // enableCache: If true, templates will be compiled once and cached for future use.
