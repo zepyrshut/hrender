@@ -1,4 +1,4 @@
-package main
+package hrender
 
 import (
 	"bytes"
@@ -226,4 +226,3 @@ func Test_Cache(t *testing.T) {
 		t.Error("did not expect 'template compiled and cached' message on second render")
 	}
 }
-
