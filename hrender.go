@@ -29,9 +29,12 @@ const (
 	ContentTextHTMLUTF8 string = "text/html; charset=utf-8"
 )
 
-// NewHTMLRender initializes a new Render instance.
-// fileSystem: The file system containing the templates (usually embed.FS or os.DirFS).
-// enableCache: If true, templates will be compiled once and cached for future use.
+// NewHTMLRender initializes a new HRender instance, setting up the template engine.
+// It configures the file system to load templates from, enables or disables caching,
+// and registers a default "dict" function for template use.
+//
+// fileSystem: The `fs.FS` implementation from which templates will be loaded (e.g., `embed.FS` or `os.DirFS`).
+// enableCache: If `true`, compiled templates will be stored in an in-memory cache for faster retrieval on subsequent renders.
 func NewHTMLRender(fileSystem fs.FS, enableCache bool) *HRender {
 	return &HRender{
 		fs:          fileSystem,
@@ -43,20 +46,83 @@ func NewHTMLRender(fileSystem fs.FS, enableCache bool) *HRender {
 	}
 }
 
-// AddFunc registers a custom function to the template's FuncMap.
-// This must be called before rendering any templates if you want the function to be available.
+// AddFunc registers a custom function with the template's FuncMap.
+// This method must be called before any templates are rendered for the function
+// to be available within the templates.
+//
+// name: The name by which the function will be called within the template.
+// fn: The Go function to be registered. Its signature must be compatible with `html/template` expectations.
 func (r *HRender) AddFunc(name string, fn any) {
 	r.funcMap[name] = fn
 }
 
-// Render executes the template for the given pageName and writes the result to w.
-// pageName: The path to the page template (e.g., "pages/login.html").
-// data: The data map to be passed to the template.
-// layoutName: (Optional) The path to the layout template (e.g., "layouts/base.html").
+// Render executes the specified template (pageName) with the provided data and writes the
+// resulting HTML to the `http.ResponseWriter`. It can optionally apply a layout template.
 //
-// If caching is enabled, it checks the cache first. If not found (or cache disabled),
-// it compiles the template (merging layout and page) and caches it if appropriate.
+// This function handles template compilation (with caching if enabled) and execution,
+// ensuring that any errors during execution do not result in partial responses.
+//
+// w: The `http.ResponseWriter` to which the rendered HTML will be written.
+// pageName: The base name of the page template to render (e.g., "pages/login.html").
+// data: A map of data (`H`) to be passed into the template for dynamic content generation.
+// layoutName: (Optional) The name of the layout template to wrap the page content (e.g., "layouts/base.html").
+//
+//	The page content will be embedded where `{{ embed }}` or `{{embed}}` is found in the layout.
 func (r *HRender) Render(w http.ResponseWriter, pageName string, data H, layoutName ...string) error {
+	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
+	if err != nil {
+		return err
+	}
+
+	return r.execute(w, tmpl, data)
+}
+
+// RenderToString executes the specified template (pageName) with the provided data and
+// returns the resulting HTML as a string. It can optionally apply a layout template.
+//
+// This function is useful for scenarios where the rendered HTML needs to be further processed,
+// sent as part of an SSE stream, or returned as a plain string rather than directly written
+// to an `http.ResponseWriter`.
+//
+// pageName: The base name of the page template to render (e.g., "pages/login.html").
+// data: A map of data (`H`) to be passed into the template for dynamic content generation.
+// layoutName: (Optional) The name of the layout template to wrap the page content (e.g., "layouts/base.html").
+//
+//	The page content will be embedded where `{{ embed }}` or `{{embed}}` is found in the layout.
+//
+// Returns:
+//
+//	A string containing the rendered HTML.
+//	An error if template compilation or execution fails.
+func (r *HRender) RenderToString(pageName string, data H, layoutName ...string) (string, error) {
+	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
+	if err != nil {
+		return "", err
+	}
+
+	var buf bytes.Buffer
+
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
+}
+
+// getTemplateInstance retrieves a compiled template. It first checks if the template
+// is available in the cache (if caching is enabled). If not found or caching is disabled,
+// it proceeds to build the template by combining the page and optional layout, and
+// parsing all associated fragments. If caching is enabled, the newly built template
+// is stored in the cache before being returned.
+//
+// pageName: The name of the main page template.
+// layoutName: (Optional) The name of the layout template.
+//
+// Returns:
+//
+//	A pointer to `template.Template` instance ready for execution.
+//	An error if template files cannot be read or parsing fails.
+func (r *HRender) getTemplateInstance(pageName string, layoutName ...string) (*template.Template, error) {
 	if !strings.HasSuffix(pageName, ".html") {
 		pageName += ".html"
 	}
@@ -82,37 +148,40 @@ func (r *HRender) Render(w http.ResponseWriter, pageName string, data H, layoutN
 		cachedTmpl, ok := r.cache[cacheKey]
 		r.cacheMu.RUnlock()
 		if ok {
-			return r.execute(w, cachedTmpl, data)
+			return cachedTmpl, nil // Retorna si está en caché
 		}
 
 		r.cacheMu.Lock()
+		defer r.cacheMu.Unlock()
 		if cachedTmpl, ok = r.cache[cacheKey]; ok {
-			r.cacheMu.Unlock()
-			return r.execute(w, cachedTmpl, data)
+			return cachedTmpl, nil
 		}
 
 		tmpl, err = r.buildTemplate(pageName, layout)
 		if err != nil {
-			r.cacheMu.Unlock()
-			return err
+			return nil, err
 		}
 
 		r.cache[cacheKey] = tmpl
 		slog.Debug("template compiled and cached", "key", cacheKey)
-		r.cacheMu.Unlock()
+		return tmpl, nil
 
 	} else {
-		tmpl, err = r.buildTemplate(pageName, layout)
-		if err != nil {
-			return err
-		}
+		return r.buildTemplate(pageName, layout)
 	}
-
-	return r.execute(w, tmpl, data)
 }
 
-// execute runs the template into a buffer first to catch any execution errors
-// before writing to the response writer. This prevents partial writes on error.
+// execute renders the provided template with data into an internal buffer.
+// If successful, it writes the buffer's content to the `http.ResponseWriter`.
+// This prevents partial HTTP responses in case of template execution errors.
+//
+// w: The `http.ResponseWriter` to write the rendered content to.
+// tmpl: The `*template.Template` instance to execute.
+// data: The data map (`H`) to pass to the template.
+//
+// Returns:
+//
+//	An error if template execution or writing to the response writer fails.
 func (r *HRender) execute(w http.ResponseWriter, tmpl *template.Template, data H) error {
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
@@ -122,10 +191,18 @@ func (r *HRender) execute(w http.ResponseWriter, tmpl *template.Template, data H
 	return err
 }
 
-// buildTemplate constructs a new template instance by:
-// 1. Reading the page content.
-// 2. Reading the layout content (if provided) and embedding the page content into it using {{ embed }}.
-// 3. Walking the file system to parse all other available templates (fragments/components) so they can be invoked.
+// buildTemplate reads the specified page and layout (if provided) files from the file system,
+// embeds the page content into the layout (if a layout is used), and then parses
+// all other HTML files in the file system as named templates (fragments/components)
+// to be available for inclusion within the main template.
+//
+// pageName: The name of the primary page template file.
+// layoutName: The name of the layout template file, or an empty string if no layout is used.
+//
+// Returns:
+//
+//	A fully parsed `*template.Template` instance configured with `FuncMap` and all discovered fragments.
+//	An error if template files are not found or parsing fails.
 func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template, error) {
 	pageContent, err := fs.ReadFile(r.fs, pageName)
 	if err != nil {
