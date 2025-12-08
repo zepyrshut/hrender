@@ -11,7 +11,7 @@ import (
 	"testing/fstest"
 )
 
-func Test_Render(t *testing.T) {
+func Test_RenderW(t *testing.T) {
 	tests := []struct {
 		name          string
 		mockFS        fstest.MapFS
@@ -90,13 +90,37 @@ func Test_Render(t *testing.T) {
 			expectedBody: `<button id="myButton" class="btn btn-primary">Click Me</button>`,
 		},
 		{
-			name: "error page not found due to wrong extension",
+			name: "auto-append .html to page",
 			mockFS: fstest.MapFS{
-				"index.another": {
-					Data: []byte(`<h1>Hello, wrong extension!</h1>`),
+				"about.html": {
+					Data: []byte(`<h1>About</h1>`),
 				},
 			},
-			page:          "index.another",
+			page:         "about",
+			expectedBody: "<h1>About</h1>",
+		},
+		{
+			name: "auto-append .html to layout",
+			mockFS: fstest.MapFS{
+				"contact.html": {
+					Data: []byte(`<p>Contact</p>`),
+				},
+				"base.html": {
+					Data: []byte(`<div>{{ embed }}</div>`),
+				},
+			},
+			page:         "contact.html",
+			layout:       "base",
+			expectedBody: "<div><p>Contact</p></div>",
+		},
+		{
+			name: "error page not found",
+			mockFS: fstest.MapFS{
+				"index.html": {
+					Data: []byte(`<h1>Exists</h1>`),
+				},
+			},
+			page:          "missing.html",
 			expectedError: true,
 			expectedBody:  "",
 		},
@@ -117,7 +141,7 @@ func Test_Render(t *testing.T) {
 				layouts = append(layouts, tt.layout)
 			}
 
-			err := r.Render(rec, tt.page, tt.data, layouts...)
+			err := r.RenderW(rec, tt.page, tt.data, layouts...)
 			if tt.expectedError {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -131,6 +155,83 @@ func Test_Render(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func Test_RenderS(t *testing.T) {
+	mockFS := fstest.MapFS{
+		"index.html": {
+			Data: []byte(`<h1>{{ .Title }}</h1>`),
+		},
+	}
+
+	r := NewHTMLRender(mockFS, false)
+	data := H{"Title": "Render String"}
+
+	got, err := r.RenderS("index.html", data)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	expected := "<h1>Render String</h1>"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func Test_SharedTemplatesIsolation(t *testing.T) {
+	// This test ensures that ONLY components/ and fragments/ are loaded into the base template
+	mockFS := fstest.MapFS{
+		"pages/home.html": {
+			Data: []byte(`
+				{{ template "components/btn" . }}
+				{{ template "fragments/tbl" . }}
+				{{ template "other/ignored" . }}
+			`),
+		},
+		"components/btn.html": {
+			Data: []byte(`[BUTTON]`),
+		},
+		"fragments/tbl.html": {
+			Data: []byte(`[TABLE]`),
+		},
+		"other/ignored.html": {
+			Data: []byte(`[IGNORED]`),
+		},
+	}
+
+	r := NewHTMLRender(mockFS, false)
+
+	// Attempt to render home. It should fail because "other/ignored" is not available in the base template,
+	// and "pages/home.html" only tries to invoke it, it doesn't define it.
+	err := r.RenderW(httptest.NewRecorder(), "pages/home.html", nil)
+	if err == nil {
+		t.Fatal("expected error due to missing 'other/ignored' template, but got nil")
+	}
+
+	// Now a valid test case checking correct loading of components and fragments
+	mockFSValid := fstest.MapFS{
+		"pages/valid.html": {
+			Data: []byte(`{{ template "components/btn" . }} - {{ template "fragments/tbl" . }}`),
+		},
+		"components/btn.html": {
+			Data: []byte(`[BUTTON]`),
+		},
+		"fragments/tbl.html": {
+			Data: []byte(`[TABLE]`),
+		},
+	}
+
+	r2 := NewHTMLRender(mockFSValid, false)
+	rec := httptest.NewRecorder()
+	err = r2.RenderW(rec, "pages/valid.html", nil)
+	if err != nil {
+		t.Fatalf("unexpected error rendering valid templates: %v", err)
+	}
+
+	expected := "[BUTTON] - [TABLE]"
+	if got := rec.Body.String(); got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
 	}
 }
 
@@ -198,7 +299,7 @@ func Test_Cache(t *testing.T) {
 	r := NewHTMLRender(mockFS, true)
 
 	rec1 := httptest.NewRecorder()
-	err1 := r.Render(rec1, "index.html", nil, "main-layout.html")
+	err1 := r.RenderW(rec1, "index.html", nil, "main-layout.html")
 	if err1 != nil {
 		t.Errorf("unexpected error: %v", err1)
 	}
@@ -207,6 +308,7 @@ func Test_Cache(t *testing.T) {
 		t.Errorf("expected body %q, got %q", expected, got)
 	}
 
+	// Verify log contains "template compiled and cached"
 	if !strings.Contains(buf.String(), "template compiled and cached") {
 		t.Error("expected 'template compiled and cached' message on first render")
 	}
@@ -214,7 +316,7 @@ func Test_Cache(t *testing.T) {
 	buf.Reset()
 
 	rec2 := httptest.NewRecorder()
-	err2 := r.Render(rec2, "index.html", nil, "main-layout.html")
+	err2 := r.RenderW(rec2, "index.html", nil, "main-layout.html")
 	if err2 != nil {
 		t.Errorf("unexpected error: %v", err2)
 	}
@@ -222,7 +324,9 @@ func Test_Cache(t *testing.T) {
 		t.Errorf("expected body %q, got %q", expected, got)
 	}
 
+	// Verify log DOES NOT contain "template compiled and cached" (cache hit)
 	if strings.Contains(buf.String(), "template compiled and cached") {
 		t.Error("did not expect 'template compiled and cached' message on second render")
 	}
 }
+

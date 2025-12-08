@@ -21,6 +21,8 @@ type (
 		funcMap     template.FuncMap
 		cache       map[string]*template.Template
 		cacheMu     sync.RWMutex
+		baseTmpl    *template.Template
+		baseOnce    sync.Once
 	}
 )
 
@@ -56,7 +58,7 @@ func (r *HRender) AddFunc(name string, fn any) {
 	r.funcMap[name] = fn
 }
 
-// Render executes the specified template (pageName) with the provided data and writes the
+// RenderW executes the specified template (pageName) with the provided data and writes the
 // resulting HTML to the `http.ResponseWriter`. It can optionally apply a layout template.
 //
 // This function handles template compilation (with caching if enabled) and execution,
@@ -68,7 +70,7 @@ func (r *HRender) AddFunc(name string, fn any) {
 // layoutName: (Optional) The name of the layout template to wrap the page content (e.g., "layouts/base.html").
 //
 //	The page content will be embedded where `{{ embed }}` or `{{embed}}` is found in the layout.
-func (r *HRender) Render(w http.ResponseWriter, pageName string, data H, layoutName ...string) error {
+func (r *HRender) RenderW(w http.ResponseWriter, pageName string, data H, layoutName ...string) error {
 	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
 	if err != nil {
 		return err
@@ -77,7 +79,7 @@ func (r *HRender) Render(w http.ResponseWriter, pageName string, data H, layoutN
 	return r.execute(w, tmpl, data)
 }
 
-// RenderToString executes the specified template (pageName) with the provided data and
+// RenderS executes the specified template (pageName) with the provided data and
 // returns the resulting HTML as a string. It can optionally apply a layout template.
 //
 // This function is useful for scenarios where the rendered HTML needs to be further processed,
@@ -94,7 +96,7 @@ func (r *HRender) Render(w http.ResponseWriter, pageName string, data H, layoutN
 //
 //	A string containing the rendered HTML.
 //	An error if template compilation or execution fails.
-func (r *HRender) RenderToString(pageName string, data H, layoutName ...string) (string, error) {
+func (r *HRender) RenderS(pageName string, data H, layoutName ...string) (string, error) {
 	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
 	if err != nil {
 		return "", err
@@ -191,19 +193,23 @@ func (r *HRender) execute(w http.ResponseWriter, tmpl *template.Template, data H
 	return err
 }
 
-// buildTemplate reads the specified page and layout (if provided) files from the file system,
-// embeds the page content into the layout (if a layout is used), and then parses
-// all other HTML files in the file system as named templates (fragments/components)
-// to be available for inclusion within the main template.
-//
-// pageName: The name of the primary page template file.
-// layoutName: The name of the layout template file, or an empty string if no layout is used.
-//
-// Returns:
-//
-//	A fully parsed `*template.Template` instance configured with `FuncMap` and all discovered fragments.
-//	An error if template files are not found or parsing fails.
+// buildTemplate constructs a new template instance by cloning a pre-loaded base template
+// (containing shared components/fragments) and parsing the specific page and layout.
+// It ensures shared templates are loaded only once.
 func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template, error) {
+	var initErr error
+	r.baseOnce.Do(func() {
+		initErr = r.loadSharedTemplates()
+	})
+	if initErr != nil {
+		return nil, fmt.Errorf("failed to load shared templates: %w", initErr)
+	}
+
+	tmpl, err := r.baseTmpl.Clone()
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone base template: %w", err)
+	}
+
 	pageContent, err := fs.ReadFile(r.fs, pageName)
 	if err != nil {
 		return nil, fmt.Errorf("page not found: %w", err)
@@ -218,7 +224,6 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 		}
 
 		layoutStr := string(layoutBytes)
-
 		layoutStr = strings.ReplaceAll(layoutStr, "{{ embed }}", string(pageContent))
 		layoutStr = strings.ReplaceAll(layoutStr, "{{embed}}", string(pageContent))
 
@@ -227,13 +232,19 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 		finalContent = string(pageContent)
 	}
 
-	tmpl := template.New("root").Funcs(r.funcMap)
-
 	if _, err := tmpl.Parse(finalContent); err != nil {
 		return nil, fmt.Errorf("error parsing main content: %w", err)
 	}
 
-	err = fs.WalkDir(r.fs, ".", func(path string, d fs.DirEntry, err error) error {
+	return tmpl, nil
+}
+
+// loadSharedTemplates scans the file system for templates in "components/" and "fragments/"
+// directories and parses them into a base template instance.
+func (r *HRender) loadSharedTemplates() error {
+	r.baseTmpl = template.New("root").Funcs(r.funcMap)
+
+	err := fs.WalkDir(r.fs, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -244,7 +255,8 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 			return nil
 		}
 
-		if path == pageName || path == layoutName {
+		pathSlash := filepath.ToSlash(path)
+		if !strings.HasPrefix(pathSlash, "components/") && !strings.HasPrefix(pathSlash, "fragments/") {
 			return nil
 		}
 
@@ -253,17 +265,17 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 			return err
 		}
 
-		name := filepath.ToSlash(path)
+		name := pathSlash
 		name = strings.TrimSuffix(name, filepath.Ext(name))
 
-		_, err = tmpl.New(name).Parse(string(content))
+		_, err = r.baseTmpl.New(name).Parse(string(content))
 		return err
 	})
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error loading shared templates: %w", err)
 	}
 
-	return tmpl, nil
+	return nil
 }
 
 // Dict creates a map[string]any from a list of key-value pairs.
