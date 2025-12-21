@@ -308,7 +308,6 @@ func Test_Cache(t *testing.T) {
 		t.Errorf("expected body %q, got %q", expected, got)
 	}
 
-	// Verify log contains "template compiled and cached"
 	if !strings.Contains(buf.String(), "template compiled and cached") {
 		t.Error("expected 'template compiled and cached' message on first render")
 	}
@@ -324,9 +323,7 @@ func Test_Cache(t *testing.T) {
 		t.Errorf("expected body %q, got %q", expected, got)
 	}
 
-	// Verify log DOES NOT contain "template compiled and cached" (cache hit)
 	if strings.Contains(buf.String(), "template compiled and cached") {
 		t.Error("did not expect 'template compiled and cached' message on second render")
 	}
 }
-

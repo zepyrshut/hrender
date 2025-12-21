@@ -65,18 +65,19 @@ func (r *HRender) AddFunc(name string, fn any) {
 // ensuring that any errors during execution do not result in partial responses.
 //
 // w: The `http.ResponseWriter` to which the rendered HTML will be written.
+// status: The `http status` to write header in r.execute.
 // pageName: The base name of the page template to render (e.g., "pages/login.html").
 // data: A map of data (`H`) to be passed into the template for dynamic content generation.
 // layoutName: (Optional) The name of the layout template to wrap the page content (e.g., "layouts/base.html").
 //
 //	The page content will be embedded where `{{ embed }}` or `{{embed}}` is found in the layout.
-func (r *HRender) RenderW(w http.ResponseWriter, pageName string, data H, layoutName ...string) error {
+func (r *HRender) RenderW(w http.ResponseWriter, status int, pageName string, data any, layoutName ...string) error {
 	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
 	if err != nil {
 		return err
 	}
 
-	return r.execute(w, tmpl, data)
+	return r.execute(w, status, tmpl, data)
 }
 
 // RenderS executes the specified template (pageName) with the provided data and
@@ -96,7 +97,7 @@ func (r *HRender) RenderW(w http.ResponseWriter, pageName string, data H, layout
 //
 //	A string containing the rendered HTML.
 //	An error if template compilation or execution fails.
-func (r *HRender) RenderS(pageName string, data H, layoutName ...string) (string, error) {
+func (r *HRender) RenderS(pageName string, data any, layoutName ...string) (string, error) {
 	tmpl, err := r.getTemplateInstance(pageName, layoutName...)
 	if err != nil {
 		return "", err
@@ -178,41 +179,43 @@ func (r *HRender) getTemplateInstance(pageName string, layoutName ...string) (*t
 // This prevents partial HTTP responses in case of template execution errors.
 //
 // w: The `http.ResponseWriter` to write the rendered content to.
+// status: The `http status` to to write headers to.
 // tmpl: The `*template.Template` instance to execute.
 // data: The data map (`H`) to pass to the template.
 //
 // Returns:
 //
 //	An error if template execution or writing to the response writer fails.
-func (r *HRender) execute(w http.ResponseWriter, tmpl *template.Template, data H) error {
+func (r *HRender) execute(w http.ResponseWriter, status int, tmpl *template.Template, data any) error {
 	var buf bytes.Buffer
+
 	if err := tmpl.Execute(&buf, data); err != nil {
-		return err
+		return err // Si falla, NO hemos tocado 'w'. Podemos mandar un 500 arriba.
 	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+
 	_, err := buf.WriteTo(w)
 	return err
 }
 
-// buildTemplate constructs a new template instance by cloning a pre-loaded base template
-// (containing shared components/fragments) and parsing the specific page and layout.
-// It ensures shared templates are loaded only once.
-func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template, error) {
-	var initErr error
-	r.baseOnce.Do(func() {
-		initErr = r.loadSharedTemplates()
-	})
-	if initErr != nil {
-		return nil, fmt.Errorf("failed to load shared templates: %w", initErr)
-	}
-
-	tmpl, err := r.baseTmpl.Clone()
-	if err != nil {
-		return nil, fmt.Errorf("failed to clone base template: %w", err)
-	}
-
+// parsePageAndLayoutIntoTemplate reads the page and optional layout content and parses them
+// into the provided template instance.
+//
+// This helper function abstracts the file reading and template parsing logic for pages and layouts.
+//
+// tmpl: The target `*template.Template` instance where the content will be parsed.
+// pageName: The filename of the page template.
+// layoutName: The filename of the layout template (can be empty).
+//
+// Returns:
+//
+//	An error if reading the files or parsing the content fails.
+func (r *HRender) parsePageAndLayoutIntoTemplate(tmpl *template.Template, pageName, layoutName string) error {
 	pageContent, err := fs.ReadFile(r.fs, pageName)
 	if err != nil {
-		return nil, fmt.Errorf("page not found: %w", err)
+		return fmt.Errorf("page not found: %w", err)
 	}
 
 	var finalContent string
@@ -220,7 +223,7 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 	if layoutName != "" {
 		layoutBytes, err := fs.ReadFile(r.fs, layoutName)
 		if err != nil {
-			return nil, fmt.Errorf("layout not found: %w", err)
+			return fmt.Errorf("layout not found: %w", err)
 		}
 
 		layoutStr := string(layoutBytes)
@@ -233,17 +236,68 @@ func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template
 	}
 
 	if _, err := tmpl.Parse(finalContent); err != nil {
-		return nil, fmt.Errorf("error parsing main content: %w", err)
+		return fmt.Errorf("error parsing main content: %w", err)
+	}
+	return nil
+}
+
+// buildTemplate constructs a new template instance for the specified page and layout.
+//
+// If caching is enabled (`enableCache` is true), it clones a pre-loaded base template
+// (containing shared components) and parses the page/layout into the clone.
+// If caching is disabled, it creates a fresh template instance, parses all shared components,
+// and then parses the page/layout.
+//
+// pageName: The filename of the page template.
+// layoutName: The filename of the layout template.
+//
+// Returns:
+//
+//	A pointer to the constructed `*template.Template`.
+//	An error if any part of the template loading or parsing fails.
+func (r *HRender) buildTemplate(pageName, layoutName string) (*template.Template, error) {
+	if !r.enableCache {
+		tmpl := template.New("root").Funcs(r.funcMap)
+		if err := r.parseSharedTemplatesInto(tmpl); err != nil {
+			return nil, fmt.Errorf("failed to parse shared templates for non-cached template: %w", err)
+		}
+		if err := r.parsePageAndLayoutIntoTemplate(tmpl, pageName, layoutName); err != nil {
+			return nil, err
+		}
+		return tmpl, nil
+	}
+
+	var initErr error
+	r.baseOnce.Do(func() {
+		initErr = r.loadBaseTemplate()
+	})
+	if initErr != nil {
+		return nil, fmt.Errorf("failed to load shared templates into base: %w", initErr)
+	}
+
+	tmpl, err := r.baseTmpl.Clone() // This is the line user wants to disable when enableCache is false
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone base template: %w", err)
+	}
+
+	if err := r.parsePageAndLayoutIntoTemplate(tmpl, pageName, layoutName); err != nil {
+		return nil, err
 	}
 
 	return tmpl, nil
 }
 
-// loadSharedTemplates scans the file system for templates in "components/" and "fragments/"
-// directories and parses them into a base template instance.
-func (r *HRender) loadSharedTemplates() error {
-	r.baseTmpl = template.New("root").Funcs(r.funcMap)
-
+// parseSharedTemplatesInto scans the file system for shared templates and parses them.
+//
+// It looks for templates in "components/" and "fragments/" directories and parses them
+// into the provided template instance.
+//
+// tmpl: The `*template.Template` instance to populate with shared templates.
+//
+// Returns:
+//
+//	An error if walking the directory or parsing a template fails.
+func (r *HRender) parseSharedTemplatesInto(tmpl *template.Template) error {
 	err := fs.WalkDir(r.fs, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -268,7 +322,7 @@ func (r *HRender) loadSharedTemplates() error {
 		name := pathSlash
 		name = strings.TrimSuffix(name, filepath.Ext(name))
 
-		_, err = r.baseTmpl.New(name).Parse(string(content))
+		_, err = tmpl.New(name).Parse(string(content))
 		return err
 	})
 	if err != nil {
@@ -276,6 +330,20 @@ func (r *HRender) loadSharedTemplates() error {
 	}
 
 	return nil
+}
+
+// loadBaseTemplate initializes the base template with shared components.
+//
+// It creates a new "root" template, registers the function map, and populates it
+// with all shared templates found in the file system. This is typically used
+// to initialize the cached base template.
+//
+// Returns:
+//
+//	An error if loading the shared templates fails.
+func (r *HRender) loadBaseTemplate() error {
+	r.baseTmpl = template.New("root").Funcs(r.funcMap)
+	return r.parseSharedTemplatesInto(r.baseTmpl)
 }
 
 // Dict creates a map[string]any from a list of key-value pairs.
