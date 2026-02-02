@@ -38,14 +38,21 @@ const (
 // fileSystem: The `fs.FS` implementation from which templates will be loaded (e.g., `embed.FS` or `os.DirFS`).
 // enableCache: If `true`, compiled templates will be stored in an in-memory cache for faster retrieval on subsequent renders.
 func NewHTMLRender(fileSystem fs.FS, enableCache bool) *HRender {
-	return &HRender{
+	r := &HRender{
 		fs:          fileSystem,
 		enableCache: enableCache,
 		cache:       make(map[string]*template.Template),
-		funcMap: template.FuncMap{
-			"dict": Dict,
-		},
 	}
+
+	r.funcMap = template.FuncMap{
+		"dict":    Dict,
+		"list":    List,
+		"merge":   Merge,
+		"include": r.Include,
+		"attrs":   Attrs,
+	}
+
+	return r
 }
 
 // AddFunc registers a custom function with the template's FuncMap.
@@ -346,6 +353,60 @@ func (r *HRender) loadBaseTemplate() error {
 	return r.parseSharedTemplatesInto(r.baseTmpl)
 }
 
+func (r *HRender) Include(name string, data any) (template.HTML, error) {
+	var buf bytes.Buffer
+	var err error
+
+	if r.enableCache {
+		r.baseOnce.Do(func() { _ = r.loadBaseTemplate() })
+
+		if r.baseTmpl == nil {
+			return "", fmt.Errorf("base template not initialized")
+		}
+
+		err = r.baseTmpl.ExecuteTemplate(&buf, name, data)
+	} else {
+		t := template.New("temp_include").Funcs(r.funcMap)
+
+		if parseErr := r.parseSharedTemplatesInto(t); parseErr != nil {
+			return "", fmt.Errorf("failed to parse shared templates for include: %w", parseErr)
+		}
+
+		err = t.ExecuteTemplate(&buf, name, data)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("include error (%s): %w", name, err)
+	}
+
+	return template.HTML(buf.String()), nil
+}
+
+func List(values ...any) []any {
+	return values
+}
+
+func Merge(base any, overlays ...map[string]any) map[string]any {
+	out := make(map[string]any)
+
+	if baseMap, ok := base.(map[string]any); ok {
+		for k, v := range baseMap {
+			out[k] = v
+		}
+	} else if baseH, ok := base.(H); ok { // Soporte para tu tipo H
+		for k, v := range baseH {
+			out[k] = v
+		}
+	}
+
+	for _, overlay := range overlays {
+		for k, v := range overlay {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // Dict creates a map[string]any from a list of key-value pairs.
 // It expects an even number of arguments, where every odd argument is a string key
 // and the following argument is its value.
@@ -377,4 +438,14 @@ func Dict(values ...any) map[string]any {
 		dict[key] = values[i+1]
 	}
 	return dict
+}
+
+func Attrs(m map[string]string) template.HTMLAttr {
+	var sb strings.Builder
+	for k, v := range m {
+		if v != "" {
+			sb.WriteString(fmt.Sprintf(` %s="%s"`, k, v))
+		}
+	}
+	return template.HTMLAttr(sb.String())
 }
