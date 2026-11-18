@@ -22,6 +22,7 @@ type (
 		cache       map[string]*template.Template
 		cacheMu     sync.RWMutex
 		baseTmpl    *template.Template
+		includeTmpl *template.Template
 		baseOnce    sync.Once
 	}
 )
@@ -350,7 +351,17 @@ func (r *HRender) parseSharedTemplatesInto(tmpl *template.Template) error {
 //	An error if loading the shared templates fails.
 func (r *HRender) loadBaseTemplate() error {
 	r.baseTmpl = template.New("root").Funcs(r.funcMap)
-	return r.parseSharedTemplatesInto(r.baseTmpl)
+	if err := r.parseSharedTemplatesInto(r.baseTmpl); err != nil {
+		return err
+	}
+	// html/template refuses to Clone a template that has executed, so include
+	// runs on its own copy and baseTmpl stays clonable for every new page.
+	includeTmpl, err := r.baseTmpl.Clone()
+	if err != nil {
+		return fmt.Errorf("failed to clone base template for include: %w", err)
+	}
+	r.includeTmpl = includeTmpl
+	return nil
 }
 
 func (r *HRender) Include(name string, data any) (template.HTML, error) {
@@ -360,11 +371,11 @@ func (r *HRender) Include(name string, data any) (template.HTML, error) {
 	if r.enableCache {
 		r.baseOnce.Do(func() { _ = r.loadBaseTemplate() })
 
-		if r.baseTmpl == nil {
+		if r.includeTmpl == nil {
 			return "", fmt.Errorf("base template not initialized")
 		}
 
-		err = r.baseTmpl.ExecuteTemplate(&buf, name, data)
+		err = r.includeTmpl.ExecuteTemplate(&buf, name, data)
 	} else {
 		t := template.New("temp_include").Funcs(r.funcMap)
 

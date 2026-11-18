@@ -141,7 +141,7 @@ func Test_RenderW(t *testing.T) {
 				layouts = append(layouts, tt.layout)
 			}
 
-			err := r.RenderW(rec, tt.page, tt.data, layouts...)
+			err := r.RenderW(rec, 200, tt.page, tt.data, layouts...)
 			if tt.expectedError {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -204,7 +204,7 @@ func Test_SharedTemplatesIsolation(t *testing.T) {
 
 	// Attempt to render home. It should fail because "other/ignored" is not available in the base template,
 	// and "pages/home.html" only tries to invoke it, it doesn't define it.
-	err := r.RenderW(httptest.NewRecorder(), "pages/home.html", nil)
+	err := r.RenderW(httptest.NewRecorder(), 200, "pages/home.html", nil)
 	if err == nil {
 		t.Fatal("expected error due to missing 'other/ignored' template, but got nil")
 	}
@@ -224,7 +224,7 @@ func Test_SharedTemplatesIsolation(t *testing.T) {
 
 	r2 := NewHTMLRender(mockFSValid, false)
 	rec := httptest.NewRecorder()
-	err = r2.RenderW(rec, "pages/valid.html", nil)
+	err = r2.RenderW(rec, 200, "pages/valid.html", nil)
 	if err != nil {
 		t.Fatalf("unexpected error rendering valid templates: %v", err)
 	}
@@ -299,7 +299,7 @@ func Test_Cache(t *testing.T) {
 	r := NewHTMLRender(mockFS, true)
 
 	rec1 := httptest.NewRecorder()
-	err1 := r.RenderW(rec1, "index.html", nil, "main-layout.html")
+	err1 := r.RenderW(rec1, 200, "index.html", nil, "main-layout.html")
 	if err1 != nil {
 		t.Errorf("unexpected error: %v", err1)
 	}
@@ -315,7 +315,7 @@ func Test_Cache(t *testing.T) {
 	buf.Reset()
 
 	rec2 := httptest.NewRecorder()
-	err2 := r.RenderW(rec2, "index.html", nil, "main-layout.html")
+	err2 := r.RenderW(rec2, 200, "index.html", nil, "main-layout.html")
 	if err2 != nil {
 		t.Errorf("unexpected error: %v", err2)
 	}
@@ -325,5 +325,25 @@ func Test_Cache(t *testing.T) {
 
 	if strings.Contains(buf.String(), "template compiled and cached") {
 		t.Error("did not expect 'template compiled and cached' message on second render")
+	}
+}
+
+func Test_IncludeWithCacheKeepsBaseClonable(t *testing.T) {
+	mockFS := fstest.MapFS{
+		"components/icon.html":    {Data: []byte(`<i></i>`)},
+		"pages/with-include.html": {Data: []byte(`{{ include "components/icon" nil }}`)},
+		"pages/other.html":        {Data: []byte(`<p>other</p>`)},
+	}
+	r := NewHTMLRender(mockFS, true)
+
+	if _, err := r.RenderS("pages/with-include", nil); err != nil {
+		t.Fatalf("rendering the page with include: %v", err)
+	}
+	got, err := r.RenderS("pages/other", nil)
+	if err != nil {
+		t.Fatalf("rendering a page after an include: %v", err)
+	}
+	if got != "<p>other</p>" {
+		t.Errorf("got %q, want %q", got, "<p>other</p>")
 	}
 }
